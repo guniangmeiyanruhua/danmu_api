@@ -3,14 +3,15 @@
 
 import test from 'node:test';
 import assert from 'node:assert';
-import { matchAnime } from '../../apis/dandan-api.js';
+import { getBangumi, matchAnime, searchAnime, searchEpisodes } from '../../apis/dandan-api.js';
+import { getFongmiDanmaku } from '../../apis/clients/fongmi-api.js';
 import { Globals } from '../../configs/globals.js';
 import TencentSource from '../../sources/tencent.js';
 import AIClient from '../../utils/ai-util.js';
 import { addFavorite } from '../../utils/favorite-util.js';
-import { getLastSearch, setLastSearch } from '../../utils/cache-util.js';
+import { getLastSearch, setLastSearch, setSearchCache } from '../../utils/cache-util.js';
 import { parseResponse } from '../helpers/context.js';
-import { createFavoriteAnime, resetFavoriteState } from '../helpers/favorites.js';
+import { createFavoriteAnime, favoriteSearchResult, resetFavoriteState } from '../helpers/favorites.js';
 
 test('POST /api/v2/match 自动匹配接口（离线）', async t => {
 
@@ -31,6 +32,23 @@ test('POST /api/v2/match 自动匹配接口（离线）', async t => {
     details.set(String(anime.animeId), anime);
   };
 
+  const createAggregatedAnime = (animeId, animeTitle, entries) => ({
+    animeId,
+    bangumiId: String(animeId),
+    animeTitle,
+    aliases: [],
+    source: '360',
+    type: 'tvseries',
+    typeDescription: 'TV',
+    startDate: '2026-01-01T00:00:00.000Z',
+    episodeCount: entries.length,
+    links: entries.map((entry, index) => ({
+      id: animeId * 10 + index + 1,
+      title: entry.title,
+      url: entry.url
+    }))
+  });
+
   TencentSource.prototype.search = async (keyword, preferAnimeId, preferSource) => {
     searchCalls.push({ keyword, preferAnimeId, preferSource });
     return [{ keyword }];
@@ -50,6 +68,44 @@ test('POST /api/v2/match 自动匹配接口（离线）', async t => {
       qiyiAnime.links.forEach(link => { link.title = link.title.replace('【qq】', '【qiyi】'); });
       addCandidate(results, details, qqAnime);
       addCandidate(results, details, qiyiAnime);
+      return;
+    }
+    if (scenario === 'aggregatedPlatform') {
+      addCandidate(results, details, createAggregatedAnime(930070, '平台测试', [
+        { title: '【imgo】 第1集', url: 'https://www.mgtv.com/b/test/1.html' },
+        { title: '【qq】 第1集', url: 'https://v.qq.com/x/cover/test/1.html' },
+        { title: '【qq】 第2集', url: 'https://v.qq.com/x/cover/test/2.html' }
+      ]));
+      return;
+    }
+    if (scenario === 'mergedPlatform') {
+      const single = createFavoriteAnime(title, episodeCount, 930090);
+      const merged = createFavoriteAnime(title, episodeCount, 930091);
+      merged.source = 'tencent&bilibili';
+      merged.links.forEach(link => { link.title = link.title.replace('qq', 'tencent＆bilibili'); });
+      addCandidate(results, details, single);
+      addCandidate(results, details, merged);
+      return;
+    }
+    if (scenario === 'aggregatedMissingPlatform') {
+      addCandidate(results, details, createAggregatedAnime(930071, '平台测试', [
+        { title: '【imgo】 第1集', url: 'https://www.mgtv.com/b/test/1.html' },
+        { title: '【qq】 第2集', url: 'https://v.qq.com/x/cover/test/2.html' }
+      ]));
+      return;
+    }
+    if (scenario === 'aggregatedSpillover') {
+      addCandidate(results, details, createAggregatedAnime(930080, '平台测试(2026)【TV动画】from 360',
+        Array.from({ length: 13 }, (_, index) => ({
+          title: `【imgo】 第${index + 1}集`,
+          url: `https://www.mgtv.com/b/test/s1-${index + 1}.html`
+        }))
+      ));
+      addCandidate(results, details, createAggregatedAnime(930081, '平台测试 第二季(2026)【TV动画】from 360', [
+        { title: '【imgo】 第1集', url: 'https://www.mgtv.com/b/test/s2-1.html' },
+        { title: '【qq】 第1集', url: 'https://v.qq.com/x/cover/test/s2-1.html' },
+        { title: '【qq】 第2集', url: 'https://v.qq.com/x/cover/test/s2-2.html' }
+      ]));
       return;
     }
     if (scenario === 'year') {
@@ -252,6 +308,166 @@ test('POST /api/v2/match 自动匹配接口（离线）', async t => {
       assert.equal(noPreference.body.matches[0].episodeTitle, '【qq】 第1集');
     });
 
+    await t.test('按剧平台优先于全局，支持别名、映射和请求覆盖，不影响其他剧', async () => {
+      const env = { TITLE_PLATFORM_MAP: '航海王->iqiyi;另一部->youku', PLATFORM_ORDER: 'qq' };
+      for (const [fileName, extraEnv, animeId] of [
+        ['航海王 S01E02', {}, 930005],
+        ['航海王 S01E01 @qq', {}, 930004],
+        ['航海王外传 S01E01', {}, 930004],
+        ['海贼王 S01E01', { TITLE_MAPPING_TABLE: '海贼王->航海王' }, 930004],
+        ['海贼王 S01E01', { TITLE_MAPPING_TABLE: '海贼王->航海王', TITLE_PLATFORM_MAP: '海贼王->qiyi' }, 930005],
+        ['另一部 S01E01', { PLATFORM_ORDER: 'qiyi,qq' }, 930005]
+      ]) {
+        const { body } = await runMatch({ body: { fileName }, env: { ...env, ...extraEnv }, scn: 'platform' });
+        assert.equal(body.matches[0]?.animeId, animeId, fileName);
+      }
+      for (const [rule, animeId] of [['', 930004], [' @qiyi', 930005]]) {
+        const { body } = await runMatch({ body: { fileName: '海贼王 S01E01' }, env, scn: 'platform', table: '海贼王 S01E01 -> 航海王 S01E01' + rule });
+        assert.equal(body.matches[0]?.animeId, animeId);
+      }
+    });
+
+    await t.test('只给 A 配芒果：B 的自动匹配、分集、普通搜索和电视候选与未配置时完全一致', async () => {
+      const titleA = '山城旧事';
+      const titleB = '白帆航线';
+      const titles = [titleA, titleB, `${titleA}【外传】`, `${titleA} from Mars`, `${titleA}（外传）`];
+      const entries = [
+        { title: '【qq】 第1集', url: 'https://v.qq.com/x/cover/test/1.html' },
+        { title: '【imgo】 第1集', url: 'https://www.mgtv.com/b/test/1.html' }
+      ];
+      const records = titles.map((title, index) => createAggregatedAnime(935000 + index, title, entries));
+      const details = new Map(records.map(record => [String(record.animeId), record]));
+      const snapshot = async (rule, title, candidates = records) => {
+        resetFavoriteState({ TITLE_PLATFORM_MAP: rule, TITLE_MAPPING_TABLE: '', AUTO_MATCH_MAPPING_TABLE: '', LOG_LEVEL: 'error' });
+        Globals.aiValid = false;
+        const results = candidates.map(favoriteSearchResult);
+        for (const key of new Set([title, `${title}_S1`, titleA, title.replace(/[^\p{L}\p{N}]/gu, '')])) setSearchCache(key, results, details);
+        const request = new Request('http://localhost/api/v2/match', { method: 'POST', body: JSON.stringify({ fileName: `${title} S01E01` }) });
+        const searchUrl = new URL('http://localhost/api/v2/search/anime?keyword=' + encodeURIComponent(title));
+        const episodesUrl = new URL('http://localhost/api/v2/search/episodes?episode=1&anime=' + encodeURIComponent(title));
+        const tvUrl = new URL('http://localhost/danmaku?episode=第1集&name=' + encodeURIComponent(title));
+        return {
+          match: (await (await matchAnime(new URL(request.url), request, 'tv-ip')).json()).matches,
+          search: (await (await searchAnime(searchUrl)).json()).animes,
+          episodes: (await (await searchEpisodes(episodesUrl)).json()).animes,
+          tv: await (await getFongmiDanmaku(tvUrl, new Request(tvUrl))).json()
+        };
+      };
+      const rule = `${titleA}->imgo`;
+      for (const title of titles.slice(1)) assert.deepEqual(await snapshot(rule, title), await snapshot('', title), title);
+      const onlyOther = await snapshot('', titleB, [records[0]]);
+      assert.deepEqual(await snapshot(rule, titleB, [records[0]]), onlyOther);
+      const onlyUnrelated = await snapshot(rule, titleA, [records[1]]);
+      assert.deepEqual(onlyUnrelated.match, []);
+      assert.deepEqual(onlyUnrelated.tv, []);
+      const enabled = await snapshot(rule, titleA);
+      assert.equal(enabled.match[0]?.episodeTitle, '【imgo】 第1集');
+      assert.equal(enabled.tv[0]?.name, `${titleA} - 【imgo】 第1集`);
+      assert.equal(enabled.episodes.find(anime => anime.animeTitle === titleB).episodes[0].episodeTitle, '【qq】 第1集');
+      assert.equal((await snapshot('', titleA)).match[0]?.episodeTitle, '【qq】 第1集');
+    });
+
+    await t.test('按剧选择合并源时优先命中完整组合而非首个单源', async () => {
+      const { body } = await runMatch({
+        body: { fileName: '航海王 S01E02' }, scn: 'mergedPlatform',
+        env: { TITLE_PLATFORM_MAP: '航海王->bilibili1&qq', PLATFORM_ORDER: 'qq' }
+      });
+      assert.equal(body.matches[0]?.episodeId, 9300912);
+    });
+
+    await t.test('FongMi 先播原剧再播外传，共用同一个搜索缓存也不继承芒果优先级', async () => {
+      const title = '山城旧事';
+      const original = createFavoriteAnime(title, 2, 935100);
+      const mango = createFavoriteAnime(title, 2, 935101);
+      mango.source = 'imgo';
+      mango.links = mango.links.map(link => ({ ...link, title: link.title.replace('【qq】', '【imgo】') }));
+      resetFavoriteState({ TITLE_PLATFORM_MAP: `${title}->imgo`, LOG_LEVEL: 'error' });
+      const records = [original, mango];
+      setSearchCache(title, records.map(favoriteSearchResult), new Map(records.map(record => [String(record.animeId), record])));
+      const first = async name => {
+        const url = new URL('http://localhost/danmaku?episode=第1集&name=' + encodeURIComponent(name));
+        return (await (await getFongmiDanmaku(url, new Request(url))).json())[0].name;
+      };
+      assert.equal(await first(title), `${title} - 【imgo】 第1集`);
+      assert.equal(await first(`${title}（外传）`), `${title} - 【qq】 第1集`);
+      assert.equal(await first(title), `${title} - 【imgo】 第1集`);
+    });
+
+    await t.test('搜索在实时、缓存和收藏命中时都置顶首选合并源，不改写原顺序', async () => {
+      const keyword = '航海王';
+      resetFavoriteState({ SOURCE_ORDER: 'tencent', TITLE_PLATFORM_MAP: '航海王->qq&bilibili1', LOG_LEVEL: 'error' });
+      scenario = 'mergedPlatform';
+      searchCalls = [];
+      const url = new URL('http://localhost/api/v2/search/anime?keyword=' + keyword);
+      const ids = async () => (await (await searchAnime(url)).json()).animes.map(item => item.animeId);
+      const expected = [930091, 930090];
+      assert.deepEqual(await ids(), expected);
+      assert.deepEqual(await ids(), expected);
+      assert.equal(searchCalls.length, 1);
+      const cached = Globals.searchCache.get(keyword);
+      assert.deepEqual(cached.results.map(item => item.animeId), [...expected].reverse());
+      addFavorite(keyword, cached.results, cached.details);
+      assert.deepEqual(await ids(), expected);
+      Globals.envs.titlePlatformMap.clear();
+      assert.deepEqual(await ids(), [...expected].reverse());
+      assert.equal(searchCalls.length, 1);
+    });
+
+    await t.test('不用 match 的播放器：详情、按集搜索和 FongMi 首选同集来源，缺集时回退', async () => {
+      resetFavoriteState({ SOURCE_ORDER: 'tencent', TITLE_PLATFORM_MAP: '平台测试->qq', LOG_LEVEL: 'error' });
+      scenario = 'aggregatedPlatform';
+      const details = new Map();
+      const url = new URL('http://localhost/api/v2/search/anime?keyword=平台测试');
+      await searchAnime(url, null, null, details);
+      const episodes = async number => (await (await searchEpisodes(new URL('http://localhost/api/v2/search/episodes?anime=平台测试&episode=' + number))).json()).animes[0].episodes;
+      const ids = entries => entries.map(entry => entry.episodeId);
+      assert.deepEqual(ids(await episodes(1)), [9300702, 9300701]);
+      assert.deepEqual(ids(await episodes(2)), [9300703]);
+      const detail = await (await getBangumi('/bangumi/930070', details)).json();
+      assert.deepEqual(ids(detail.bangumi.episodes), [9300702, 9300701, 9300703]);
+      assert.deepEqual(detail.bangumi.episodes.map(entry => entry.episodeNumber), ['1', '1', '2']);
+      const fongmi = new URL('http://localhost/danmaku?name=平台测试&episode=第1集');
+      const items = await (await getFongmiDanmaku(fongmi, new Request(fongmi))).json();
+      assert.match(items[0].url, /comment\/9300702\?/);
+      Globals.envs.titlePlatformMap.set('平台测试', 'imgo');
+      assert.deepEqual(ids(await episodes(1)), [9300701, 9300702]);
+      assert.deepEqual(ids(await episodes(2)), [9300703]);
+    });
+
+    await t.test('C/G 聚合源平台去重：保留目标平台且命中精确集号', async () => {
+      const preferred = await runMatch({
+        body: { fileName: '平台测试 S01E01 @qq' },
+        clientIp: 'c2a-ip',
+        scn: 'aggregatedPlatform'
+      });
+      assert.equal(preferred.body.isMatched, true);
+      assert.equal(preferred.body.matches[0].episodeId, 9300702);
+      assert.equal(preferred.body.matches[0].episodeTitle, '【qq】 第1集');
+      assert.equal(preferred.body.matches[0].url, 'https://v.qq.com/x/cover/test/1.html');
+
+      const noPreference = await runMatch({
+        body: { fileName: '平台测试 S01E01' },
+        clientIp: 'c2b-ip',
+        scn: 'aggregatedPlatform'
+      });
+      assert.equal(noPreference.body.isMatched, true);
+      assert.equal(noPreference.body.matches[0].episodeId, 9300701);
+      assert.equal(noPreference.body.matches[0].episodeTitle, '【imgo】 第1集');
+    });
+
+    await t.test('C/G 目标平台缺少目标集时不按数组位置错配', async () => {
+      const { body } = await runMatch({
+        body: { fileName: '平台测试 S01E01 @qq' },
+        clientIp: 'c2c-ip',
+        scn: 'aggregatedMissingPlatform'
+      });
+
+      assert.equal(body.isMatched, true);
+      assert.equal(body.matches[0].episodeId, 9300711);
+      assert.equal(body.matches[0].episodeTitle, '【imgo】 第1集');
+      assert.notEqual(body.matches[0].episodeId, 9300712);
+    });
+
     await t.test('C 只有标题：季集为 null 且仍能命中', async () => {
       const { body } = await runMatch({ body: { fileName: '无忧渡' }, clientIp: 'c3-ip' });
 
@@ -361,6 +577,20 @@ test('POST /api/v2/match 自动匹配接口（离线）', async t => {
       assert.equal('autoMatchMappingApplied' in lastSearch, false);
     });
 
+    await t.test('D 跨季顺延保留目标平台条目', async () => {
+      const { status, body } = await runMatch({
+        body: { fileName: '平台测试 S01E14 @qq' },
+        clientIp: 'd4a-ip',
+        scn: 'aggregatedSpillover'
+      });
+
+      assert.equal(status, 200);
+      assert.equal(body.isMatched, true);
+      assert.equal(body.matches[0].animeId, 930081);
+      assert.equal(body.matches[0].episodeId, 9300812);
+      assert.equal(body.matches[0].episodeTitle, '【qq】 第1集');
+    });
+
     await t.test('E 缓存写入告警：未命中时经 errorMessage 暴露', async () => {
       const { body } = await runMatch({
         body: { fileName: '无忧渡 S01E01' },
@@ -413,6 +643,23 @@ test('POST /api/v2/match 自动匹配接口（离线）', async t => {
       assert.equal(aiCalls, 1);
       assert.deepStrictEqual(withAi.body.matches, normal.body.matches);
       assert.equal(withAi.body.matches[0].episodeId, 9300031);
+    });
+
+    await t.test('F AI 分支保留聚合源的目标平台条目', async () => {
+      let aiCalls = 0;
+      AIClient.prototype.ask = async () => { aiCalls++; return JSON.stringify({ animeIndex: 0 }); };
+
+      const { body } = await runMatch({
+        body: { fileName: '平台测试 S01E01 @qq' },
+        clientIp: 'f2c-ip',
+        scn: 'aggregatedPlatform',
+        ai: '你是匹配专家'
+      });
+
+      assert.equal(aiCalls, 1);
+      assert.equal(body.isMatched, true);
+      assert.equal(body.matches[0].episodeId, 9300702);
+      assert.equal(body.matches[0].episodeTitle, '【qq】 第1集');
     });
 
     await t.test('F AI 分支：模型抛错时回落普通匹配', async () => {

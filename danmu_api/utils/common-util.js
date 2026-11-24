@@ -1,6 +1,9 @@
 import { globals } from '../configs/globals.js';
+import { recordTitleDecision } from './pipeline-trace.js';
+import { sourceLogContext } from './http-util.js';
 import { log } from './log-util.js'
 import { simplized } from './zh-util.js';
+import { normalizePlatformGroup } from './platform-util.js';
 
 // =====================
 // 通用工具方法
@@ -29,6 +32,10 @@ export const extractEpisodeTitle = (title) => {
   const match = title.match(/【(.*?)】/);  // 匹配【】中的内容
   return match ? match[1] : null;  // 返回方括号中的内容，若没有匹配到，则返回null
 };
+
+export function stripEpisodePlatform(title) {
+  return title.replace(/^【[^】]+】\s*/, '').trim();
+}
 
 // 正则表达式：提取anime标题中的内容
 export const extractAnimeTitle = (str) => str.split('(')[0].trim();
@@ -117,7 +124,7 @@ export function parseFileName(fileName) {
   const afterAt = fileName.substring(atIndex + 1).trim();
 
   // 检查@符号后面是否有季集信息（如 S01E01）
-  const seasonEpisodeMatch = afterAt.match(/^(\w+)\s+(S\d+E\d+)$/);
+  const seasonEpisodeMatch = afterAt.match(/^([\w&＆]+)\s+(S\d+E\d+)$/);
   if (seasonEpisodeMatch) {
     // 格式：动漫名称@平台 S01E01
     const platform = seasonEpisodeMatch[1];
@@ -149,47 +156,13 @@ export function parseFileName(fileName) {
 
 // 将用户输入的平台名称映射为标准平台名称
 function normalizePlatformName(inputPlatform) {
-  if (!inputPlatform || typeof inputPlatform !== 'string') {
-    return '';
-  }
-
-  const input = inputPlatform.trim();
-
-  // 直接返回输入的平台名称（如果有效）
-  if (globals.allowedPlatforms.includes(input)) {
-    return input;
-  }
-
-  // 如果输入的平台名称无效，返回空字符串
-  return '';
+  return normalizePlatformGroup(inputPlatform, globals.allowedPlatforms);
 }
 
 // 根据指定平台创建动态平台顺序
-export function createDynamicPlatformOrder(preferredPlatform) {
-  if (!preferredPlatform) {
-    return [...globals.platformOrderArr]; // 返回默认顺序的副本
-  }
-
-  // 验证平台是否有效
-  if (!globals.allowedPlatforms.includes(preferredPlatform)) {
-    log("warn", `[system] [common] Invalid platform: ${preferredPlatform}, using default order`);
-    return [...globals.platformOrderArr];
-  }
-
-  // 创建新的平台顺序，将指定平台放在最前面
-  const dynamicOrder = [preferredPlatform];
-
-  // 添加其他平台（排除已指定的平台）
-  for (const platform of globals.platformOrderArr) {
-    if (platform !== preferredPlatform && platform !== null) {
-      dynamicOrder.push(platform);
-    }
-  }
-
-  // 最后添加 null（用于回退逻辑）
-  dynamicOrder.push(null);
-
-  return dynamicOrder;
+export function createDynamicPlatformOrder(...preferredPlatforms) {
+  const preferred = preferredPlatforms.map(normalizePlatformName).filter(Boolean);
+  return [...new Set([...preferred, ...globals.platformOrderArr])];
 }
 
 /**
@@ -279,15 +252,38 @@ export function getExplicitSeasonNumber(text) {
  * @param {number|null} parsedSeason - 解析出的目标季度
  * @returns {boolean} 是否匹配
  */
-export function titleMatches(title, query, parsedSeason = null, forceNonStrict = false, threshold = 0.8) {
-  if (title == null || query == null) return false;
+// 标题判定的记录名：严格模式由 STRICT_TITLE_MATCH 决定，默认规则是代码内固定的包含匹配与相似度阈值
+// 跳过标题判定的放行分支复用同一组名称，使同一配置项的判定聚合在一处
+export function titleDecisionMeta({ forceNonStrict = false, threshold = 0.8 } = {}) {
+  if (!forceNonStrict && globals.strictTitleMatch) {
+    return { config: 'STRICT_TITLE_MATCH', label: '严格标题匹配', mode: '严格匹配（标题相等或搜索词开头加季号）' };
+  }
+  return { config: null, label: '默认标题匹配（包含 / 相似度）', mode: `包含匹配 + 相似度（阈值 ${threshold}）` };
+}
+
+export function titleMatches(title, query, parsedSeason = null, forceNonStrict = false, threshold = 0.8, group = null) {
+  const strictMode = !forceNonStrict && globals.strictTitleMatch;
+  const decision = titleDecisionMeta({ forceNonStrict, threshold });
+  // 偏好记录、跨季预筛等场景传入 forceNonStrict，不作为过滤判定登记
+  const finish = (matched, reason) => {
+    if (!forceNonStrict) {
+      recordTitleDecision({
+        ...decision, group, source: sourceLogContext.getStore() || '', query, value: title, matched, reason,
+      });
+    }
+    return matched;
+  };
+  if (title == null || query == null) return finish(false, '标题或搜索词为空');
 
   const titleText = String(title);
   const queryText = String(query);
-  if (!titleText || !queryText) return false;
+  if (!titleText || !queryText) return finish(false, '标题或搜索词为空');
 
   // 策略1：严格模式仅允许头部或完全匹配（forceNonStrict 为 true 时跳过，用于偏好记录等场景）
-  if (!forceNonStrict && globals.strictTitleMatch) return strictTitleMatch(titleText, queryText);
+  if (strictMode) {
+    const matched = strictTitleMatch(titleText, queryText);
+    return finish(matched, matched ? '严格匹配：完全相等或搜索词开头加季号' : '严格匹配：标题不以搜索词开头');
+  }
 
   // 剧名杂音清理：移除画质/配音/版本等杂音词，避免阻塞匹配
   const tagFilter = globals.titleNoiseFilter || null;
@@ -326,15 +322,15 @@ export function titleMatches(title, query, parsedSeason = null, forceNonStrict =
     if (querySeason > 1) {
       // 搜索指定续作(>1)时，仅当源标题明确包含季号时才校验季号一致性
       // 源标题无季号的不分季长剧不应被此规则拦截，交由上游源处理器决定
-      if (titleSeason !== null && titleSeason !== querySeason) return false;
+      if (titleSeason !== null && titleSeason !== querySeason) return finish(false, `季度校验：标题 S${titleSeason} 与查询 S${querySeason} 不一致`);
     } else if (querySeason === 1) {
       // 搜索第1季时，拦截明确标明为其他季度(如第2季、第3季)的结果
-      if (titleSeason !== null && titleSeason !== 1) return false;
+      if (titleSeason !== null && titleSeason !== 1) return finish(false, `季度校验：标题 S${titleSeason} 与查询 S1 不一致`);
     }
   }
 
   // 策略2：包含匹配优先 (性能最优且准确，只要完整包含任意变种即匹配)
-  if (qList.some(kw => t.includes(kw))) return true;
+  if (qList.some(kw => t.includes(kw))) return finish(true, '包含匹配命中');
 
   // 策略3：相似度匹配 (阈值0.8)
   const simMatch = qList.some(kw => {
@@ -368,11 +364,11 @@ export function titleMatches(title, query, parsedSeason = null, forceNonStrict =
       const yearQ = normalizeTitleForMatch(cleanYear).toLowerCase();
       // 仅当标题不含年份时才接受兜底，保留用户刻意用年份过滤的语义
       const titleHasYear = /[\(\（]\s*(?:19|20)\d{2}\s*[\)\）]|\b(?:19|20)\d{2}\b/.test(titleText);
-      if (yearQ && t.includes(yearQ) && !titleHasYear) return true;
+      if (yearQ && t.includes(yearQ) && !titleHasYear) return finish(true, '去年份兜底命中');
     }
   }
 
-  return simMatch;
+  return finish(simMatch, simMatch ? '相似度匹配命中' : '包含匹配与相似度匹配均未命中');
 }
 
 /**
@@ -398,9 +394,10 @@ export function validateType(value, expectedType, fieldName) {
   }
 }
 
-// 从 animeTitle 中提取季数和纯剧名
+// 从 animeTitle 中提取季数、纯剧名与剥去年份的完整标题
+// fullTitle 保留季号等内容，供需要按完整片名匹配的场景使用（如偏移规则）
 export function extractSeasonNumberFromAnimeTitle(animeTitle) {
-  if (!animeTitle) return { season: null, baseTitle: null };
+  if (!animeTitle) return { season: null, baseTitle: null, fullTitle: null };
   // 先在原始标题上做拆分切除年份后缀，再去除非法字符
   const match = animeTitle.match(/^(.*?)\(\d{4}\)/);
   const rawTitleWithoutYear = match ? match[1].trim() : animeTitle.split("(")[0].trim();
@@ -412,6 +409,7 @@ export function extractSeasonNumberFromAnimeTitle(animeTitle) {
     return {
       season: convertChineseNumber(explicitSeasonMatch[1]),
       baseTitle: titleWithoutYear.replace(explicitSeasonMatch[0], "").trim(),
+      fullTitle: titleWithoutYear,
     };
   }
 
@@ -421,6 +419,7 @@ export function extractSeasonNumberFromAnimeTitle(animeTitle) {
     return {
       season: parseInt(seasonMatch[1], 10),
       baseTitle: titleWithoutYear.replace(seasonMatch[0], "").trim(),
+      fullTitle: titleWithoutYear,
     };
   }
 
@@ -430,6 +429,7 @@ export function extractSeasonNumberFromAnimeTitle(animeTitle) {
     return {
       season: parseInt(partMatch[1], 10),
       baseTitle: titleWithoutYear.replace(partMatch[0], "").trim(),
+      fullTitle: titleWithoutYear,
     };
   }
 
@@ -439,11 +439,12 @@ export function extractSeasonNumberFromAnimeTitle(animeTitle) {
     const season = parseInt(trailingNumber[1], 10);
     // 尾部"00"等不合法的季号不视为季数标识（如"机动战士高达00"）
     if (season === 0) {
-      return { season: null, baseTitle: titleWithoutYear };
+      return { season: null, baseTitle: titleWithoutYear, fullTitle: titleWithoutYear };
     }
     return {
       season,
       baseTitle: titleWithoutYear.slice(0, titleWithoutYear.lastIndexOf(trailingNumber[1])).trim(),
+      fullTitle: titleWithoutYear,
     };
   }
 
@@ -453,6 +454,7 @@ export function extractSeasonNumberFromAnimeTitle(animeTitle) {
     return {
       season: convertChineseNumber(trailingChinese[1]),
       baseTitle: titleWithoutYear.replace(trailingChinese[0], "").trim(),
+      fullTitle: titleWithoutYear,
     };
   }
 
@@ -462,18 +464,20 @@ export function extractSeasonNumberFromAnimeTitle(animeTitle) {
     return {
       season: romanMatch[0].codePointAt(0) - 0x2160 + 1,
       baseTitle: titleWithoutYear.replace(romanMatch[0], "").trim(),
+      fullTitle: titleWithoutYear,
     };
   }
 
-  return { season: null, baseTitle: titleWithoutYear };
+  return { season: null, baseTitle: titleWithoutYear, fullTitle: titleWithoutYear };
 }
 
 // 从集标题中提取集数（支持多种格式：第1集、第01集、EP01、E01等）
-export function extractEpisodeNumberFromTitle(episodeTitle) {
+export function extractEpisodeNumberFromTitle(episodeTitle, ordinalOnly = false) {
   if (!episodeTitle) return null;
+  if (ordinalOnly) episodeTitle = episodeTitle.replace(/(?<!\d)(?:19|20)\d{2}(?:0[1-9]|1[0-2])(?:0[1-9]|[12]\d|3[01])(?!\d)/g, ' ');
 
   // 匹配格式：第1集、第01集、第1话、第1回等
-  const chineseMatch = episodeTitle.match(/第(\d+)[集话回]/);
+  const chineseMatch = episodeTitle.match(ordinalOnly ? /第\s*(\d+)\s*[集话回期]/ : /第(\d+)[集话回]/);
   if (chineseMatch) {
     return parseInt(chineseMatch[1], 10);
   }
@@ -493,10 +497,10 @@ export function extractEpisodeNumberFromTitle(episodeTitle) {
   return null;
 }
 
-// 从标题中提取动漫名称、季数和集数
+// 从标题中提取动漫名称、完整标题、季数和集数
 export function extractAnimeInfo(animeTitle, episodeTitle) {
-  let {season, baseTitle} = extractSeasonNumberFromAnimeTitle(animeTitle);
+  let {season, baseTitle, fullTitle} = extractSeasonNumberFromAnimeTitle(animeTitle);
   let episode = extractEpisodeNumberFromTitle(episodeTitle);
 
-  return { baseTitle, season, episode };
+  return { baseTitle, fullTitle, season, episode };
 }

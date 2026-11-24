@@ -18,6 +18,15 @@ const UI_THEMES = {
 const UI_THEME_STORAGE_KEY = 'logvar_ui_theme';
 const UI_SCHEME_STORAGE_KEY = 'logvar_ui_color_scheme';
 
+// 系统管理接口需要 ADMIN_TOKEN：命中 401 时给出统一提示，避免被当成普通失败反复重试
+function isAdminAuthError(status, result) {
+    return status === 401 || (result && result.errorCode === 401);
+}
+
+function alertAdminTokenRequired() {
+    customAlert('系统管理接口需要有效的 ADMIN_TOKEN。\\n\\n请先在服务端配置 ADMIN_TOKEN，再通过 /{ADMIN_TOKEN}/ 访问本页后重试。');
+}
+
 function getStoredTheme() {
     try {
         const theme = String(localStorage.getItem(UI_THEME_STORAGE_KEY) || '').toLowerCase();
@@ -211,15 +220,21 @@ function normalizeImportedConfig(data) {
 }
 
 async function saveImportedConfigValue(key, value) {
-    const request = (endpoint) => fetch(buildApiUrl(endpoint), {
+    // 系统管理接口必须携带 ADMIN_TOKEN（buildApiUrl 第二参数为 true）
+    const request = (endpoint) => fetch(buildApiUrl(endpoint, true), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ key, value })
-    }).then(response => response.json());
+    }).then(async response => ({ status: response.status, result: await response.json() }));
 
-    let result = await request('/api/env/set');
+    let { status, result } = await request('/api/env/set');
+    if (isAdminAuthError(status, result)) {
+        const hint = result?.errorMessage || '需要有效的 ADMIN_TOKEN';
+        result = { ...result, success: false, message: hint, errorMessage: hint };
+        return result;
+    }
     if (!result.success) {
-        result = await request('/api/env/add');
+        ({ result } = await request('/api/env/add'));
     }
     return result;
 }
@@ -887,32 +902,20 @@ function renderValueInput(item) {
 
     } else if (type === 'map') {
         // 映射表类型
-        const pairs = value ? value.split(';').map(pair => pair.trim()).filter(pair => pair) : [];
-        const mapItems = pairs.map(pair => {
-            if (pair.includes('->')) {
-                const [left, right] = pair.split('->').map(s => s.trim());
-                return { left, right };
-            }
-            return { left: pair, right: '' };
-        });
+        const options = previewState.categorizedVars[editingCategory]?.find(entry => entry.key === currentKey)?.options || item?.options || [];
 
         container.innerHTML = \`
             <label>映射配置</label>
             <textarea id="map-bulk-value" rows="6" placeholder="原值->映射值;原值2->映射值2">\${escapeHtml(value || '')}</textarea>
             <button type="button" class="btn btn-secondary" onclick="parseBulkMapItems()">\${uiIcon('refresh-cw')} 解析并更新列表</button>
-            <div class="map-container" id="map-container">
-                \${mapItems.map((item, index) => \`
-                    <div class="map-item" data-index="\${index}">
-                        <input type="text" class="map-input-left" placeholder="原始值" value="\${item.left}">
-                        <span class="map-separator">-></span>
-                        <input type="text" class="map-input-right" placeholder="映射值" value="\${item.right}">
-                        <button type="button" class="btn btn-danger map-remove-btn" onclick="removeMapItem(this)">删除</button>
-                    </div>
-                \`).join('')}
+            <div class="map-container" id="map-container" oninput="syncBulkMapValue()">
                 <div class="map-item-template" style="display: none;">
-                    <input type="text" class="map-input-left" placeholder="原始值">
+                    <input type="text" class="map-input-left" placeholder="\${options.length ? '剧名' : '原始值'}">
                     <span class="map-separator">-></span>
-                    <input type="text" class="map-input-right" placeholder="映射值">
+                    \${options.length ? \`<select class="map-input-right" aria-label="匹配来源">
+                        <option value="">选择匹配来源</option>
+                        \${options.map(option => \`<option value="\${escapeHtml(option)}">\${escapeHtml(option)}</option>\`).join('')}
+                    </select>\` : '<input type="text" class="map-input-right" placeholder="映射值">'}
                     <button type="button" class="btn btn-danger map-remove-btn" onclick="removeMapItem(this)">删除</button>
                 </div>
             </div>
@@ -923,7 +926,7 @@ function renderValueInput(item) {
             \${renderRecentDataPanel()}
         \`;
 
-        bindMapInputSync();
+        parseBulkMapItems(true);
 
     } else {
         // 文本输入
@@ -934,6 +937,7 @@ function renderValueInput(item) {
         const isColorPool = currentKey === 'COLOR_POOL';
         const isDanmuOffset = currentKey === 'DANMU_OFFSET';
 		const isCustomMergeRules = currentKey === 'CUSTOM_MERGE_RULES';
+        const isRemoteMappingUrl = currentKey === 'TITLE_MAPPING_TABLE_URL';
         const offsetSources = item && item.sources ? item.sources : [];
         const isTitleFilter = currentKey === 'ANIME_TITLE_FILTER' || currentKey === 'EPISODE_TITLE_FILTER' || currentKey === 'TITLE_NOISE_FILTER';
         const recentDataBlock = isTitleFilter ? \`<div style="margin-top: 8px; display: flex; justify-content: flex-end;">\${renderRecentDataButton()}</div>\${renderRecentDataPanel()}\` : '';
@@ -1156,6 +1160,16 @@ function renderValueInput(item) {
                         <button type="button" class="btn btn-sm" onclick="toggleMergeRulePanel()">取消</button>
                         <button type="button" class="btn btn-primary btn-sm" onclick="appendMergeRule()">确认添加</button>
                     </div>
+                </div>
+            \`;
+        } else if (isRemoteMappingUrl) {
+            container.innerHTML = \`
+                <label>变量值</label>
+                <input type="url" id="text-value" placeholder="https://example.com/title-mapping.txt" value="\${escapeHtml(value || '')}">
+                <div class="form-help">修改地址后请先保存。Serverless 冷启动后的首次标题匹配会同步下载远端映射，最长约等待 5 秒；配置本地址即表示接受该延迟。也可点击下方按钮立即更新。</div>
+                <div style="margin-top: 10px; display: flex; align-items: center; gap: 10px;">
+                    <button type="button" class="btn btn-secondary" onclick="refreshRemoteMapping(this)">立即更新</button>
+                    <span class="remote-refresh-status text-gray font-size-12" aria-live="polite"></span>
                 </div>
             \`;
         } else if (value && value.length > 50) {
@@ -2509,6 +2523,43 @@ function renderEnvList() {
     list.innerHTML = html || (themeMatched ? '' : '<div class="preview-empty"><strong>未找到匹配配置</strong><span>请尝试其他关键词</span></div>');
 }
 
+// 手动更新远程剧名映射表
+async function refreshRemoteMapping(button) {
+    if (!button || button.disabled) return;
+    const status = button.parentElement && button.parentElement.querySelector('.remote-refresh-status');
+    const setStatus = (text, isError = false) => {
+        if (status) {
+            status.textContent = text;
+            status.className = 'remote-refresh-status font-size-12 ' + (isError ? 'text-red' : 'text-gray');
+        }
+    };
+    const originalText = button.textContent;
+    button.disabled = true;
+    button.textContent = '更新中...';
+    setStatus('正在连接远程表…');
+    try {
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 10000);
+        let response;
+        try {
+            response = await fetch(buildApiUrl('/api/title-mapping/refresh', true), { method: 'POST', signal: controller.signal });
+        } finally {
+            clearTimeout(timeoutId);
+        }
+        const result = await response.json();
+        if (!response.ok || !result.success) {
+            throw new Error(result.errorMessage || '远程映射表更新失败');
+        }
+        button.textContent = '更新成功';
+        setStatus('成功更新' + (result.count || 0) + '条规则');
+        setTimeout(() => { button.textContent = originalText; button.disabled = false; }, 1500);
+    } catch (error) {
+        button.textContent = originalText;
+        button.disabled = false;
+        setStatus(error.message || '失败', true);
+    }
+}
+
 // 编辑环境变量
 function editEnv(category, index, editButton) {
     const item = (envVariables[category] || [])[index];
@@ -2557,15 +2608,20 @@ function deleteEnv(category, index, deleteButton) {
             deleteButton.disabled = true;
 
             // 调用API删除环境变量
-            fetch(buildApiUrl('/api/env/del'), {
+            fetch(buildApiUrl('/api/env/del', true), {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json'
                 },
                 body: JSON.stringify({ key })
             })
-            .then(response => response.json())
-            .then(result => {
+            .then(async response => ({ status: response.status, result: await response.json() }))
+            .then(({ status, result }) => {
+                if (isAdminAuthError(status, result)) {
+                    addLog(\`删除配置项失败: \${result.errorMessage || '需要有效的 ADMIN_TOKEN'}\`, 'error');
+                    alertAdminTokenRequired();
+                    return;
+                }
                 if (result.success) {
                     // 从本地数据中删除
                     envVariables[category].splice(index, 1);
@@ -2634,18 +2690,8 @@ document.getElementById('env-form').addEventListener('submit', async function(e)
     } else if (type === 'map') {
         // 获取映射表值
         parseBulkMapItems(true);
-        const mapItems = document.querySelectorAll('#map-container .map-item');
-        const pairs = [];
-        mapItems.forEach(item => {
-            const leftInput = item.querySelector('.map-input-left');
-            const rightInput = item.querySelector('.map-input-right');
-            const leftValue = leftInput.value.trim();
-            const rightValue = rightInput.value.trim();
-            if (leftValue && rightValue) {
-                pairs.push(leftValue + '->' + rightValue);
-            }
-        });
-        value = pairs.join(';');
+        syncBulkMapValue();
+        value = document.getElementById('map-bulk-value').value;
         itemData = { key, value, description, type };
     } else {
         value = document.getElementById('text-value').value.trim();
@@ -2664,7 +2710,7 @@ document.getElementById('env-form').addEventListener('submit', async function(e)
             return;
         }
         // 首先尝试使用set接口更新
-        let response = await fetch(buildApiUrl('/api/env/set'), {
+        let response = await fetch(buildApiUrl('/api/env/set', true), {
             method: 'POST',
             headers: {
                 'Content-Type': 'application/json'
@@ -2674,9 +2720,16 @@ document.getElementById('env-form').addEventListener('submit', async function(e)
 
         let result = await response.json();
 
+        // 系统管理接口需要 ADMIN_TOKEN，鉴权失败时不再回落 add 接口
+        if (isAdminAuthError(response.status, result)) {
+            addLog(\`操作失败: \${result.errorMessage || '需要有效的 ADMIN_TOKEN'}\`, 'error');
+            alertAdminTokenRequired();
+            return;
+        }
+
         if (!result.success) {
             // 如果set接口失败，尝试使用add接口
-            response = await fetch(buildApiUrl('/api/env/add'), {
+            response = await fetch(buildApiUrl('/api/env/add', true), {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json'
@@ -2685,6 +2738,12 @@ document.getElementById('env-form').addEventListener('submit', async function(e)
             });
 
             result = await response.json();
+
+            if (isAdminAuthError(response.status, result)) {
+                addLog(\`操作失败: \${result.errorMessage || '需要有效的 ADMIN_TOKEN'}\`, 'error');
+                alertAdminTokenRequired();
+                return;
+            }
         }
 
         if (result.success) {
@@ -2737,29 +2796,27 @@ function parseBulkMapItems(silent = false) {
     });
     container.querySelectorAll('.map-item').forEach(item => item.remove());
     for (const [left, right] of latest) {
-        const row = document.createElement('div'); row.className = 'map-item';
-        row.innerHTML = '<input type="text" class="map-input-left"><span class="map-separator">-&gt;</span><input type="text" class="map-input-right"><button type="button" class="btn btn-danger map-remove-btn" onclick="removeMapItem(this)">删除</button>';
-        row.querySelector('.map-input-left').value = left;
-        row.querySelector('.map-input-right').value = right;
-        container.insertBefore(row, container.querySelector('.map-item-template'));
+        addMapItem(left, right);
     }
     if (invalid.length && !silent) addLog('Invalid mapping entries ignored: ' + invalid.join(', '), 'warning');
     return invalid.length === 0;
 }
 
 // 添加映射项
-function addMapItem() {
+function addMapItem(left = '', right = '') {
     const container = document.getElementById('map-container');
     const template = document.querySelector('.map-item-template');
     const newItem = template.cloneNode(true);
     newItem.style.display = 'flex';
     newItem.classList.remove('map-item-template');
     newItem.classList.add('map-item');
-    const index = container.querySelectorAll('.map-item').length;
-    newItem.setAttribute('data-index', index);
-    container.appendChild(newItem);
-    newItem.querySelectorAll('.map-input-left, .map-input-right').forEach(input => input.addEventListener('input', syncBulkMapValue));
-    syncBulkMapValue();
+    newItem.querySelector('.map-input-left').value = left;
+    const target = newItem.querySelector('.map-input-right');
+    if (target.options && right && !Array.from(target.options).some(option => option.value === right)) {
+        target.add(new Option(right, right));
+    }
+    target.value = right;
+    container.insertBefore(newItem, template);
 }
 
 // 删除映射项
@@ -2781,11 +2838,6 @@ function syncBulkMapValue() {
     }).filter(Boolean).join(';');
 }
 
-function bindMapInputSync() {
-    document.querySelectorAll('#map-container .map-input-left, #map-container .map-input-right').forEach(input => {
-        input.addEventListener('input', syncBulkMapValue);
-    });
-}
 /* ========================================
    Bilibili Cookie 扫码登录功能
    ======================================== */

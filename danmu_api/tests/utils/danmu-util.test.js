@@ -128,3 +128,96 @@ test('danmu groupDanmusByMinute 分组路径同样按时间升序返回', () => 
   const out = groupDanmusByMinute(input, 1, false);
   assert.ok(out.every((d, i) => i === 0 || out[i - 1].t <= d.t), '分组路径应保持时间升序');
 });
+
+test('danmu groupDanmusByMinute 排序在副本上进行，入参顺序不变', () => {
+  const input = [
+    { p: '30.00,1,16777215,[dandan]', m: 'B', cid: 1, t: 30 },
+    { p: '10.00,1,16777215,[dandan]', m: 'A', cid: 2, t: 10 },
+  ];
+  const before = input.map(danmu => danmu.p);
+  groupDanmusByMinute(input, 0, true);
+
+  assert.deepStrictEqual(input.map(danmu => danmu.p), before, '调用方持有的数组不应被就地排序');
+});
+
+test('danmu convertToDanmakuJson 未开启分组时仍按时间点合并多源重复', () => {
+  Globals.init({ GROUP_MINUTE: '0', DANMU_LIMIT: '0', CONVERT_COLOR: 'default', BLOCKED_WORDS: '' });
+  const out = convertToDanmakuJson([
+    { p: '776.32,5,16755202,[bilibili]', m: '你就不能干掉本体吗', cid: 1, t: 776.32, _sourceLabel: 'bilibili' },
+    { p: '776.32,5,16755202,[dandan]', m: '你就不能干掉本体吗', cid: 2, t: 776.32, _sourceLabel: 'dandan' },
+    { p: '800.00,1,16777215,[bilibili]', m: '只有 B 站有', cid: 3, t: 800, _sourceLabel: 'bilibili' },
+  ], 'dandan＆bilibili');
+
+  assert.strictEqual(out.length, 2, '同一时间点的相同内容应合并，不同内容保留');
+  const merged = out.find(d => d.t === 776.32);
+  assert.strictEqual(merged.p, '776.32,5,16755202,[bilibili＆dandan]', '合并后应带上两个来源标签');
+});
+
+test('danmu convertToDanmakuJson 单源且未开启分组时不合并', () => {
+  Globals.init({ GROUP_MINUTE: '0', DANMU_LIMIT: '0', CONVERT_COLOR: 'default', BLOCKED_WORDS: '' });
+  const out = convertToDanmakuJson([
+    { p: '10.00,1,16777215,[dandan]', m: '同一条', cid: 1, t: 10, _sourceLabel: 'dandan' },
+    { p: '10.00,1,16777215,[dandan]', m: '同一条', cid: 2, t: 10, _sourceLabel: 'dandan' },
+  ], 'dandan');
+
+  assert.strictEqual(out.length, 2, '单源不去重时保留全部弹幕');
+});
+
+test('danmu convertToDanmakuJson 多源且未开启分组时按时点去重而非按分钟', () => {
+  Globals.init({ GROUP_MINUTE: '0', DANMU_LIMIT: '0', CONVERT_COLOR: 'default', BLOCKED_WORDS: '' });
+  // 10.00 与 10.50 落在同一分钟但不同时间点：按分钟分组会被合并，按时点分组不会
+  const out = convertToDanmakuJson([
+    { p: '10.00,1,16777215,[bilibili]', m: '同一句话', cid: 1, t: 10, _sourceLabel: 'bilibili' },
+    { p: '10.50,1,16777215,[dandan]', m: '同一句话', cid: 2, t: 10.5, _sourceLabel: 'dandan' },
+  ], 'dandan＆bilibili');
+
+  assert.strictEqual(out.length, 2, '同一分钟内不同时间点的弹幕不应合并');
+  assert.deepStrictEqual(out.map(d => d.t), [10, 10.5], '输出顺序按时间升序');
+});
+
+test('danmu convertToDanmakuJson 多源未开启分组时合并相差一个百分位的同一条弹幕', () => {
+  Globals.init({ GROUP_MINUTE: '0', DANMU_LIMIT: '0', CONVERT_COLOR: 'default', BLOCKED_WORDS: '' });
+  // 弹弹按两位小数存储，同一条弹幕可能落在相邻的两个百分位（251.25 / 251.26）
+  const out = convertToDanmakuJson([
+    { p: '251.25,1,16777215,[dandan]', m: '嗅觉不是对习惯的味道更加不敏感吗', cid: 1, _sourceLabel: 'dandan' },
+    { p: '251.26,1,16777215,[dandan]', m: '嗅觉不是对习惯的味道更加不敏感吗', cid: 2, _sourceLabel: 'dandan' },
+    { p: '251.255,1,16777215,[bilibili]', m: '嗅觉不是对习惯的味道更加不敏感吗', cid: 3, _sourceLabel: 'bilibili' },
+  ], 'dandan＆bilibili');
+
+  assert.strictEqual(out.length, 1, '相差不超过 10ms 的同一内容应合并为一条');
+  assert.strictEqual(out[0].t, 251.25, '合并后保留最早的时间');
+});
+
+test('danmu convertToDanmakuJson 多源未开启分组时先按时间排序再聚簇', () => {
+  Globals.init({ GROUP_MINUTE: '0', DANMU_LIMIT: '0', CONVERT_COLOR: 'default', BLOCKED_WORDS: '' });
+  // 输入降序：不先排序时后一条与前一条之差为负，会被当成相邻时间点
+  const out = convertToDanmakuJson([
+    { p: '40.00,1,16777215,[dandan]', m: '同一句话', cid: 1, _sourceLabel: 'dandan' },
+    { p: '30.00,1,16777215,[dandan]', m: '同一句话', cid: 2, _sourceLabel: 'dandan' },
+  ], 'dandan＆bilibili');
+
+  assert.deepStrictEqual(out.map(d => d.t), [30, 40], '相隔 10s 的同内容不应按相邻时间点合并');
+});
+
+test('danmu convertToDanmakuJson 多源未开启分组时超出容差的时间点不合并', () => {
+  Globals.init({ GROUP_MINUTE: '0', DANMU_LIMIT: '0', CONVERT_COLOR: 'default', BLOCKED_WORDS: '' });
+  const out = convertToDanmakuJson([
+    { p: '10.00,1,16777215,[dandan]', m: '同一句话', cid: 1, _sourceLabel: 'dandan' },
+    { p: '10.01,1,16777215,[bilibili]', m: '同一句话', cid: 2, _sourceLabel: 'bilibili' },
+    { p: '10.03,1,16777215,[dandan]', m: '同一句话', cid: 3, _sourceLabel: 'dandan' },
+  ], 'dandan＆bilibili');
+
+  assert.deepStrictEqual(out.map(d => d.t), [10, 10.03], '相隔 10ms 合并为一点，30ms 另起一点');
+});
+
+test('danmu convertToDanmakuJson 多源且按分钟去重时同分钟内容合并', () => {
+  Globals.init({ GROUP_MINUTE: '1', DANMU_LIMIT: '0', CONVERT_COLOR: 'default', BLOCKED_WORDS: '' });
+  // 同样两条数据，开启分组后应落在同一分钟区间内被合并，用于对照上一条用例的分组粒度
+  const out = convertToDanmakuJson([
+    { p: '10.00,1,16777215,[bilibili]', m: '同一句话', cid: 1, t: 10, _sourceLabel: 'bilibili' },
+    { p: '10.50,1,16777215,[dandan]', m: '同一句话', cid: 2, t: 10.5, _sourceLabel: 'dandan' },
+  ], 'dandan＆bilibili');
+
+  assert.strictEqual(out.length, 1, '开启分钟分组后同一分钟内的相同内容应合并');
+  assert.strictEqual(out[0].p, '10.00,1,16777215,[bilibili＆dandan]', '合并后带上两个来源标签');
+});

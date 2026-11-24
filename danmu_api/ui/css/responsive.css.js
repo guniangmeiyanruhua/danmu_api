@@ -119,11 +119,16 @@ export const responsiveCssContent = /* css */ `
         justify-content: space-between;
     }
 
+    /* 总览的宽度与下方选项一致 */
     .preview-back-btn {
-        grid-column: 1 / -1;
-        width: calc((100% - 10px) / 3);
-        min-width: 0;
-        justify-self: start;
+        grid-column: 1;
+    }
+
+    /* 四项并排（8 项两行排完）时总览与选项同行；容纳不下第四列、需要第三行时才独占一行。534px 为实测临界宽度 */
+    @media (max-width: 534px) {
+        .preview-back-btn + .preview-category-btn {
+            grid-column: 1;
+        }
     }
 
     .preview-search {
@@ -165,18 +170,6 @@ export const responsiveCssContent = /* css */ `
 
     .preview-item-description {
         margin: 6px 0 0;
-    }
-
-    .record-header {
-        flex-direction: column;
-        align-items: stretch;
-    }
-
-    .record-method,
-    .record-interface,
-    .record-ip {
-        width: 100%;
-        box-sizing: border-box;
     }
 
     .footer {

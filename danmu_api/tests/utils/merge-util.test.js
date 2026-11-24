@@ -10,6 +10,8 @@ import { Envs } from '../../configs/envs.js';
 import { Globals } from '../../configs/globals.js';
 import { Season } from '../../models/dandan-model.js';
 import { findSecondaryMatches, applyMergeLogic, resolveDubVersionLinkIndex, mergeLinkEntry } from '../../utils/merge-util.js';
+import { AsyncLocalStorage } from 'node:async_hooks';
+import { createTrace, runWithTrace, traceStep, useAsyncLocalStorage } from '../../utils/pipeline-trace.js';
 
 test('merge findSecondaryMatches 忽略规则与剧集标题的季度与类型噪声', () => {
   Globals.init({ LOG_LEVEL: 'error' });
@@ -295,6 +297,41 @@ test('merge findSecondaryMatches 同一配音版本只并入一条', () => {
     ],
   }).length, 1, '同一作品的同语言结果只保留最高分一条');
 });
+test('merge findSecondaryMatches 剧场版阻断按标题与别名全集比对', () => {
+  Globals.init({ LOG_LEVEL: 'error' });
+  const buildAnime = (animeId, animeTitle, source, typeDescription, startDate, count, aliases = []) => ({
+    animeId,
+    bangumiId: String(animeId),
+    animeTitle,
+    aliases,
+    source,
+    type: typeDescription,
+    typeDescription,
+    startDate,
+    links: Array.from({ length: count }, (_, i) => ({ title: `第${i + 1}集` })),
+    episodeCount: count,
+  });
+
+  // 电影（bilibili）与动画某季（animeko）因「别名」命中完全一致而得到 1.0 相似度，
+  // 剧场版阻断须在「标题 + 别名」全集上判定，才能拦住这类跨类型误合并
+  const movie  = buildAnime(1, '银河护卫队(2014)【电影】from bilibili', 'bilibili', '电影', '2014-08-01T00:00:00.000Z', 2);
+  const series = buildAnime(2, '银河守护者 第一季(2015)【TV动画】from animeko', 'animeko', 'TV动画', '2015-09-26T00:00:00.000Z', 26, ['银河护卫队']);
+  assert.deepStrictEqual(
+    findSecondaryMatches(movie, [series], new Set(), ['animeko']).map((a) => a.animeId),
+    [],
+    '电影与共享别名的动画季不应合并',
+  );
+
+  // 同为 TV 动画且标题一致仍正常合并，阻断不影响常规匹配
+  const tvPrimary   = buildAnime(3, '银河守护者 第二季(2017)【TV动画】from dandan', 'dandan', 'TV动画', '2017-01-01T00:00:00.000Z', 25);
+  const tvSecondary = buildAnime(4, '银河守护者 第二季(2017)【TV动画】from animeko', 'animeko', 'TV动画', '2017-01-01T00:00:00.000Z', 25);
+  assert.deepStrictEqual(
+    findSecondaryMatches(tvPrimary, [tvSecondary], new Set(), ['animeko']).map((a) => a.animeId),
+    [4],
+    'TV 动画之间不受剧场版阻断影响',
+  );
+});
+
 test('merge applyMergeLogic 集对齐不绕过年份校验', async () => {
   Globals.init({ LOG_LEVEL: 'error', MERGE_SOURCE_PAIRS: 'tencent&aiyifan' });
   const epLinks = (count, name) => Array.from({ length: count }, (_, i) => ({
@@ -1029,4 +1066,69 @@ test('merge applyMergeLogic 映射表动态注入源受权限沙箱约束', asyn
   } finally {
     Globals.init({ LOG_LEVEL: 'error' });
   }
+});
+
+test('merge applyMergeLogic 合并后按最终 links 重算总集数', async () => {
+  Globals.init({ LOG_LEVEL: 'error', MERGE_SOURCE_PAIRS: 'dandan&animeko' });
+  const buildAnime = (animeId, animeTitle, source, count) => ({
+    animeId,
+    bangumiId: String(animeId),
+    animeTitle,
+    aliases: [],
+    source,
+    type: 'TV动画',
+    typeDescription: 'TV动画',
+    startDate: '2026-01-01T00:00:00.000Z',
+    links: Array.from({ length: count }, (_, i) => ({ title: `第${i + 1}集`, url: `${source}:${animeId}:${i}:第${i + 1}集` })),
+    episodeCount: count,
+  });
+
+  // 主源 2 集、副源 5 集、同标题同年：合并后 links 覆盖副源全部集
+  const primary   = buildAnime(1, '重算集数测试番剧(2026)【TV动画】from dandan', 'dandan', 2);
+  const secondary = buildAnime(2, '重算集数测试番剧(2026)【TV动画】from animeko', 'animeko', 5);
+  Globals.animes = [primary, secondary];
+  await applyMergeLogic([primary, secondary]);
+
+  const merged = Globals.animes.find((a) => a.animeTitle.startsWith('重算集数测试番剧') && a.animeTitle.includes('from dandan&animeko'));
+  assert.ok(merged, '应产生合并条目');
+  assert.ok(merged.links.length > 2, '合并后 links 多于主源');
+  assert.strictEqual(merged.episodeCount, merged.links.length, '总集数以最终 links 为准');
+});
+
+test('applyMergeLogic 登记源合并明细供接口详情展示', async () => {
+  useAsyncLocalStorage(AsyncLocalStorage);
+  Globals.init({ LOG_LEVEL: 'error', MERGE_SOURCE_PAIRS: 'dandan&bilibili,renren' });
+  process.env.CUSTOM_MERGE_RULES = '';
+
+  const buildAnime = (animeId, animeTitle, source, links) => ({
+    animeId, bangumiId: String(animeId), animeTitle, aliases: [],
+    source, type: 'web', typeDescription: '网络放送',
+    startDate: '2026-03-18T16:00:00.000Z', links,
+  });
+  const buildLinks = (count, platform) => Array.from({ length: count }, (_, i) => ({
+    id: 100 + i,
+    title: `【${platform}】 第${i + 1}集`,
+    url: `https://example.com/${platform}/${i + 1}`,
+  }));
+
+  // 追踪作用域内执行合并，使登记落到步骤
+  const trace = createTrace('GET', '/api/v2/search/anime');
+  const curAnimes = [
+    buildAnime(1, '合并主源(2026)【网络放送】from dandan', 'dandan', buildLinks(3, 'dandan')),
+    buildAnime(2, '合并主源(2026)【网络放送】from bilibili', 'bilibili', buildLinks(3, 'bilibili')),
+    buildAnime(3, '独立结果(2026)【网络放送】from renren', 'renren', buildLinks(2, 'renren')),
+  ];
+  // 合并是异步过程：结束后再归档步骤，登记才能带上合并明细
+  await runWithTrace(trace, async () => {
+    await applyMergeLogic(curAnimes, new Map());
+    traceStep('搜索·源合并与过滤', Date.now(), {});
+  });
+
+  const change = trace.steps[0].changes.find(c => c.config === 'MERGE_SOURCE_PAIRS');
+  assert.ok(change, '应登记源合并明细');
+  assert.equal(change.kind, 'stats');
+  assert.equal(change.context.单源保留, 'renren', '单源保留配置应说明');
+  assert.match(change.summary, /3 条候选合并为 2 条/);
+  assert.ok(change.table.rows.some(row => String(row.结果).includes('副源')), '合并项应列出副源');
+  assert.ok(change.table.rows.some(row => String(row.结果).includes('已并入')), '被消费的原始条目应说明去向');
 });
